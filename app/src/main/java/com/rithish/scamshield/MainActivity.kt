@@ -1,22 +1,31 @@
 package com.rithish.scamshield
 
 import android.Manifest
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.rithish.scamshield.service.ScamShieldMonitorService
+import com.rithish.scamshield.ui.EnglishStrings
+import com.rithish.scamshield.ui.HomeScreen
+import com.rithish.scamshield.ui.LocalAppStrings
+import com.rithish.scamshield.ui.LocalOnLanguageSwitch
+import com.rithish.scamshield.ui.TamilStrings
 import com.rithish.scamshield.ui.theme.ScamShieldTheme
 
 class MainActivity : ComponentActivity() {
@@ -35,12 +44,22 @@ class MainActivity : ComponentActivity() {
 
         checkAndRequestPermissions()
 
-        if (!android.provider.Settings.canDrawOverlays(this)) {
+        if (!Settings.canDrawOverlays(this)) {
             val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION
+                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                Uri.parse("package:$packageName")
             )
             startActivity(intent)
         }
+
+        // Android 15 blocks SMS_RECEIVED for non-default SMS apps. Use notification access instead.
+        promptNotificationAccessIfNeeded()
+
+        // Prompt to disable battery optimization so scam overlay works when app is in background
+        promptBatteryOptimizationIfNeeded()
+
+        // Start persistent monitor so protection works when app is swiped away or in background
+        startMonitorService()
 
         val testNumber = "9876543210"
 
@@ -51,8 +70,56 @@ class MainActivity : ComponentActivity() {
         }
 
         setContent {
+            val prefs = getSharedPreferences("app", Context.MODE_PRIVATE)
+            var isTamil by remember {
+                mutableStateOf(prefs.getBoolean("use_tamil", true))
+            }
+            val strings = if (isTamil) TamilStrings else EnglishStrings
             ScamShieldTheme {
-                ScamShieldUI()
+                CompositionLocalProvider(
+                    LocalAppStrings provides strings,
+                    LocalOnLanguageSwitch provides {
+                        isTamil = !isTamil
+                        prefs.edit().putBoolean("use_tamil", isTamil).apply()
+                    }
+                ) {
+                    HomeScreen(
+                        strings = strings,
+                        isTamil = isTamil,
+                        onLanguageSwitch = {
+                            isTamil = !isTamil
+                            prefs.edit().putBoolean("use_tamil", isTamil).apply()
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private fun startMonitorService() {
+        val intent = Intent(this, ScamShieldMonitorService::class.java)
+        try {
+            ContextCompat.startForegroundService(this, intent)
+        } catch (_: Exception) { }
+    }
+
+    private fun promptBatteryOptimizationIfNeeded() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            try {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
+                }
+                startActivity(intent)
+            } catch (_: Exception) {
+                // Fallback: open app details so user can disable battery optimization manually
+                try {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) { }
             }
         }
     }
@@ -72,6 +139,16 @@ class MainActivity : ComponentActivity() {
                 100
             )
         }
+    }
+
+    private fun promptNotificationAccessIfNeeded() {
+        val enabled = NotificationManagerCompat.getEnabledListenerPackages(this)
+            .contains(packageName)
+        if (enabled) return
+
+        try {
+            startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        } catch (_: Exception) { }
     }
 
     private fun isScamNumber(number: String): Boolean {
@@ -94,18 +171,5 @@ class MainActivity : ComponentActivity() {
             Log.d("SCAM_ALERT", "Safe call")
             false
         }
-    }
-}
-
-@Composable
-fun ScamShieldUI() {
-    Box(
-        modifier = Modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(
-            text = "Scam Protection Active",
-            fontSize = 22.sp
-        )
     }
 }
